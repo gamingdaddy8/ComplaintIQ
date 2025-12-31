@@ -1,11 +1,16 @@
 import smtplib
+import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
-# ⚠️ You must use an "App Password" if using Gmail, not your real password.
-SENDER_EMAIL = "marketingofficial560@gmail.com"  # <--- REPLACE THIS
-SENDER_PASSWORD = "euvj sxaj gjsj mnwp"  # <--- REPLACE THIS
+# Load environment variables from the .env file
+load_dotenv()
+
+# Securely fetch credentials
+SENDER_EMAIL = os.getenv("GMAIL_USER")
+SENDER_PASSWORD = os.getenv("GMAIL_PASSWORD")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -13,6 +18,12 @@ def send_resolution_email(to_email, customer_name, complaint_id, status, action_
     """
     Sends a formatted email to the customer when their ticket is updated.
     """
+    
+    # Safety Check: Ensure credentials exist before trying to send
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        print("❌ Error: Email credentials not found. Make sure you have a .env file.")
+        return False
+
     try:
         # 1. Setup the Email
         msg = MIMEMultipart()

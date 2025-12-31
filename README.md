@@ -48,6 +48,7 @@ Follow these steps to run the project locally.
 ### Prerequisites
 * Python 3.9 or higher
 * Git
+Screenshots
 
 ### 1. Clone the Repository
 ```bash

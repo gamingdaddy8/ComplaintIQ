@@ -389,19 +389,24 @@ def show_dashboard():
 
             with st.chat_message("assistant", avatar="🤖"):
                 try:
+                    # 1. Get the FULL response (Text + Data)
                     res = requests.post(f"{API_URL}/chat", params={"query": prompt})
-                    response_data = res.json().get("response", "Error processing request.")
+                    full_response = res.json() 
                     
-                    if isinstance(response_data, list):
-                        st.dataframe(pd.DataFrame(response_data))
-                        st.write("Here represent the relevant records.")
-                        st.session_state.messages.append({"role": "assistant", "content": "Here are the relevant records."})
-                    elif isinstance(response_data, dict):
-                        st.json(response_data)
-                        st.session_state.messages.append({"role": "assistant", "content": str(response_data)})
-                    else:
-                        st.markdown(response_data)
-                        st.session_state.messages.append({"role": "assistant", "content": response_data})
+                    # 2. Extract the Text Message
+                    bot_reply = full_response.get("response", "Error processing request.")
+                    
+                    # 3. Display the Text
+                    st.markdown(bot_reply)
+                    
+                    # 4. Display the Data Table (If it exists)
+                    if "data" in full_response:
+                        df_result = pd.DataFrame(full_response["data"])
+                        st.dataframe(df_result, use_container_width=True)
+                    
+                    # 5. Save ONLY the text to chat history (to keep history clean)
+                    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
+                    
                 except Exception as e:
                     st.error(f"AI Error: {e}")
 

@@ -1,19 +1,23 @@
 import sqlite3
 import pandas as pd
 from datetime import datetime
-import bcrypt  # <--- WE USE THIS DIRECTLY NOW
+import bcrypt
 
 class DataHandler:
     def __init__(self, db_name="complaints.db"):
-        # check_same_thread=False is needed for FastAPI multithreading
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
+        self.db_name = db_name
         self.create_table()
 
+    def get_conn(self):
+        """Helper to get a fresh connection every time."""
+        return sqlite3.connect(self.db_name, check_same_thread=False)
+
     def create_table(self):
-        """Creates all necessary tables if they don't exist."""
+        """Creates tables if they don't exist."""
+        conn = self.get_conn()
         
         # 1. Complaints Table
-        query_complaints = """
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             complaint TEXT,
@@ -23,160 +27,163 @@ class DataHandler:
             priority TEXT,
             action TEXT,
             status TEXT DEFAULT 'Open',
-            date_logged TIMESTAMP,
+            date_logged TEXT,
             customer_name TEXT,
             account_number TEXT,
             email TEXT,
             phone TEXT
         )
-        """
-        self.conn.execute(query_complaints)
+        """)
 
         # 2. Keywords Table
-        query_keywords = """
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS keywords (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT,
-            word TEXT UNIQUE
+            word TEXT,
+            UNIQUE(category, word)
         )
-        """
-        self.conn.execute(query_keywords)
+        """)
 
-        # 3. Users Table (For Login)
-        query_users = """
+        # 3. Users Table
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE,
-            password_hash TEXT,
-            full_name TEXT,
-            role TEXT DEFAULT 'Agent'
+            email TEXT PRIMARY KEY,
+            password TEXT,
+            full_name TEXT
         )
-        """
-        self.conn.execute(query_users)
+        """)
         
-        self.conn.commit()
-        self.initialize_keywords()
-
-    def initialize_keywords(self):
-        """Adds default keywords if table is empty."""
-        try:
-            check = self.conn.execute("SELECT count(*) FROM keywords").fetchone()[0]
-            if check == 0:
-                defaults = {
-                    "Loan": ["loan", "emi", "interest", "repayment"],
-                    "Credit Card": ["card", "credit", "debit", "limit"],
-                    "Account": ["account", "balance", "statement", "transfer"],
-                    "Fraud": ["fraud", "scam", "unauthorized", "hack"],
-                    "Customer Service": ["service", "support", "response", "delay"]
-                }
-                for cat, words in defaults.items():
-                    for w in words:
-                        self.conn.execute("INSERT INTO keywords (category, word) VALUES (?, ?)", (cat, w))
-                self.conn.commit()
-                print("✅ Default keywords initialized.")
-        except Exception as e:
-            print(f"⚠️ Warning initializing keywords: {e}")
+        # Seed Keywords
+        check = conn.execute("SELECT count(*) FROM keywords").fetchone()[0]
+        if check == 0:
+            defaults = [
+                ('Loan', 'emi'), ('Loan', 'interest'), ('Loan', 'loan'),
+                ('Credit Card', 'card'), ('Credit Card', 'limit'), ('Credit Card', 'statement'),
+                ('Fraud', 'scam'), ('Fraud', 'hack'), ('Fraud', 'unauthorized'),
+                ('Account', 'balance'), ('Account', 'saving'), ('Account', 'deposit')
+            ]
+            conn.executemany("INSERT INTO keywords (category, word) VALUES (?, ?)", defaults)
+        
+        conn.commit()
+        conn.close()
 
     # --- CORE METHODS ---
 
-    def save_results(self, results_df):
-        if "date_logged" not in results_df.columns:
-            results_df["date_logged"] = datetime.now()
-        if "status" not in results_df.columns:
-            results_df["status"] = "Open"
-        results_df.to_sql("complaints", self.conn, if_exists="append", index=False)
+    def save_results(self, df):
+        conn = self.get_conn()
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO complaints (
+                    complaint, category, sentiment, urgency, priority, 
+                    action, status, date_logged, customer_name, 
+                    account_number, email, phone
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row['complaint'], 
+                row['category'], 
+                row['sentiment'], 
+                row['urgency'], 
+                row['priority'], 
+                row.get('action', 'Pending Review'), 
+                'Open', 
+                current_time, 
+                str(row.get('customer_name', 'Unknown')), 
+                str(row.get('account_number', 'N/A')), 
+                str(row.get('email', '')), 
+                str(row.get('phone', ''))
+            ))
+        
+        conn.commit()
+        conn.close()
 
     def load_data(self):
-        return pd.read_sql("SELECT * FROM complaints", self.conn)
+        conn = self.get_conn()
+        try:
+            df = pd.read_sql("SELECT * FROM complaints", conn)
+        except:
+            df = pd.DataFrame()
+        finally:
+            conn.close()
+        return df
 
     def get_metrics(self):
         df = self.load_data()
         if df.empty: return {"total": 0, "critical": 0, "resolved": 0}
+        
         return {
             "total": len(df),
             "critical": len(df[df["priority"] == "P1 - Critical"]),
             "resolved": len(df[df["status"] == "Resolved"])
         }
 
+    # --- MISSING METHODS RESTORED HERE ---
+    
+    def update_complaint(self, complaint_id, status, action):
+        """Updates the status and action of a complaint."""
+        conn = self.get_conn()
+        try:
+            conn.execute("UPDATE complaints SET status = ?, action = ? WHERE id = ?", (status, action, complaint_id))
+            conn.commit()
+            return True
+        except: 
+            return False
+        finally: 
+            conn.close()
+
     def get_complaint(self, complaint_id):
-        cursor = self.conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
+        """Fetches a single complaint (Used for sending emails)."""
+        conn = self.get_conn()
+        try:
+            cursor = conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,))
+            row = cursor.fetchone()
+            if row:
+                # Convert tuple to dict
+                cols = [description[0] for description in cursor.description]
+                return dict(zip(cols, row))
+        except: 
+            pass
+        finally: 
+            conn.close()
         return None
 
-    def update_complaint(self, complaint_id, status, action):
-        try:
-            self.conn.execute("UPDATE complaints SET status = ?, action = ? WHERE id = ?", (status, action, complaint_id))
-            self.conn.commit()
-            return True
-        except: return False
-
+    # --- SETTINGS & AUTH ---
+        
     def get_keywords(self):
-        cursor = self.conn.execute("SELECT category, word FROM keywords")
-        keywords = {}
-        for row in cursor.fetchall():
-            cat, word = row
-            if cat not in keywords: keywords[cat] = []
-            keywords[cat].append(word)
-        return keywords
+        conn = self.get_conn()
+        cursor = conn.execute("SELECT category, word FROM keywords")
+        kb = {}
+        for cat, word in cursor.fetchall():
+            if cat not in kb: kb[cat] = []
+            kb[cat].append(word)
+        conn.close()
+        return kb
 
     def add_keyword(self, category, word):
+        conn = self.get_conn()
         try:
-            self.conn.execute("INSERT INTO keywords (category, word) VALUES (?, ?)", (category, word.lower()))
-            self.conn.commit()
+            conn.execute("INSERT INTO keywords (category, word) VALUES (?, ?)", (category, word.lower()))
+            conn.commit()
             return True
         except: return False
-
-    # --- NEW SECURITY METHODS (DIRECT BCRYPT) ---
-
-    def get_password_hash(self, password):
-        """Hashes password using bcrypt directly."""
-        # Convert password to bytes
-        pwd_bytes = password.encode('utf-8')
-        # Generate salt and hash
-        salt = bcrypt.gensalt()
-        hashed = bcrypt.hashpw(pwd_bytes, salt)
-        # Return as string for storage
-        return hashed.decode('utf-8')
-
-    def verify_password(self, plain_password, hashed_password):
-        """Verifies password using bcrypt directly."""
-        try:
-            pwd_bytes = plain_password.encode('utf-8')
-            hashed_bytes = hashed_password.encode('utf-8')
-            return bcrypt.checkpw(pwd_bytes, hashed_bytes)
-        except ValueError:
-            return False
-
+        finally: conn.close()
+    
     def create_user(self, email, password, full_name):
-        """Registers a new user."""
+        conn = self.get_conn()
         try:
-            hashed_pw = self.get_password_hash(password)
-            self.conn.execute(
-                "INSERT INTO users (email, password_hash, full_name) VALUES (?, ?, ?)", 
-                (email, hashed_pw, full_name)
-            )
-            self.conn.commit()
-            print(f"✅ Created user: {email}")
+            hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+            conn.execute("INSERT INTO users (email, password, full_name) VALUES (?, ?, ?)", 
+                         (email, hashed, full_name))
+            conn.commit()
             return True
-        except sqlite3.IntegrityError:
-            print(f"⚠️ Registration Failed: {email} already exists.")
-            return False
-        except Exception as e:
-            print(f"❌ CRITICAL DB ERROR: {e}") 
-            return False
+        except: return False
+        finally: conn.close()
 
     def authenticate_user(self, email, password):
-        """Checks email and password."""
-        cursor = self.conn.execute("SELECT password_hash, full_name, role FROM users WHERE email=?", (email,))
-        row = cursor.fetchone()
-        if row:
-            stored_hash = row[0]
-            if self.verify_password(password, stored_hash):
-                return {"email": email, "name": row[1], "role": row[2]}
+        conn = self.get_conn()
+        row = conn.execute("SELECT password, full_name FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
+        if row and bcrypt.checkpw(password.encode(), row[0]):
+            return {"email": email, "name": row[1]}
         return None
-        
-    def close(self):
-        self.conn.close()

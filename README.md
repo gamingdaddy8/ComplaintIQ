@@ -83,11 +83,11 @@ streamlit run frontend/app.py
 App will open in your browser at: http://localhost:8501
 
 
-🔮 Future Enhancements
-[ ] Integration with WhatsApp Business API.
+--- Future Enhancements 
+ Integration with WhatsApp Business API.
 
-[ ] Multi-Language Support (Hindi/Regional).
+ Multi-Language Support (Hindi/Regional).
 
-[ ] Migration to Cloud PostgreSQL for global scaling.
+ Migration to Cloud PostgreSQL for global scaling.
 
-Developed by Rudresh Gawas Final Year IT Project | 2025
+Developed by Rudresh Gawas  | 2025

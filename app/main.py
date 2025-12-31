@@ -1,30 +1,32 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import io
-
-# ... (existing imports) ...
-
-class UserRegister(BaseModel):
-    email: str
-    password: str
-    full_name: str
-
-class UserLogin(BaseModel):
-    email: str
-    password: str
-
-from app.complaint_analyzer import ComplaintAnalyzer
-from app.chatbot_engine import ChatbotEngine
 from app.data_handler import DataHandler
-from app.mailer import send_resolution_email  # <--- NEW IMPORT for Email Feature
-from fastapi.responses import Response # <--- Needed to send file
-from app.report_generator import generate_pdf_report # <--- Your new file
+from app.chatbot_engine import ChatbotEngine
+from app.complaint_analyzer import ComplaintAnalyzer # <--- IMPORTED BACK
 
-app = FastAPI(title="ComplaintIQ API")
+# Optional: Report Generator
+try:
+    from app.report_generator import generate_pdf_report
+except ImportError:
+    generate_pdf_report = None
 
-# Allow frontend access
+try:
+    from app.mailer import send_resolution_email
+except ImportError:
+    send_resolution_email = None
+
+app = FastAPI()
+
+# 1. Initialize Database
+db = DataHandler()
+
+# 2. Initialize Custom Analyzer
+# We pass the current DB keywords to it immediately
+analyzer = ComplaintAnalyzer(keywords_dict=db.get_keywords())
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,111 +34,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------
-# INITIALIZATION
-# -------------------------
-# 1. Initialize Database Handler FIRST
-db = DataHandler()
+# --- MODELS ---
+class UserLogin(BaseModel):
+    email: str
+    password: str
 
-# 2. Load Keywords from Database
-keywords_from_db = db.get_keywords()
+class UserRegister(BaseModel):
+    email: str
+    password: str
+    full_name: str
 
-# 3. Initialize Logic Classes with those keywords
-analyzer = ComplaintAnalyzer(keywords_dict=keywords_from_db)
+class KeywordRequest(BaseModel):
+    category: str
+    word: str
+
+class ComplaintUpdate(BaseModel):
+    id: int
+    status: str
+    action: str
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 def home():
     return {"message": "ComplaintIQ Backend is running"}
 
-# -------------------------
-# CSV Analysis Endpoint (UPDATED FOR CUSTOMER DATA)
-# -------------------------
 @app.post("/analyze")
 async def analyze_complaints(file: UploadFile = File(...)):
-    # Read the file content
-    contents = await file.read()
-    df = pd.read_csv(io.BytesIO(contents))
+    # 1. Read File
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except:
+        return {"error": "Invalid CSV file."}
 
-    # VALIDATION: Check for required columns
-    # We now require Customer Name and Email to support notifications
-    required_cols = ["complaint", "Customer Name", "Email"]
-    if not all(col in df.columns for col in required_cols):
-        return {"error": f"CSV must contain columns: {required_cols}"}
+    # 2. CRITICAL: Sync Analyzer with Settings
+    # This ensures new keywords from the Settings tab are used immediately
+    latest_keywords = db.get_keywords()
+    analyzer.update_keywords(latest_keywords)
 
     analyzed_data = []
-
-    # Iterate through rows to keep customer data synced with analysis
+    
+    # 3. Process Rows using the External Analyzer
     for index, row in df.iterrows():
-        # 1. Analyze the text
-        result = analyzer.analyze(row["complaint"])
+        text = str(row.get('complaint', ''))
+        if not text or text.lower() == 'nan': continue
         
-        # 2. Attach Customer Info to the result
-        result["customer_name"] = row.get("Customer Name", "Unknown")
-        result["email"] = row.get("Email", "")
-        result["phone"] = row.get("Phone", "")
-        result["account_number"] = row.get("Account Number", "")
+        # --- CALL THE CUSTOM ANALYZER ---
+        result = analyzer.analyze(text)
+        
+        # Add Customer Metadata
+        result["customer_name"] = str(row.get('Customer Name', 'Unknown'))
+        result["account_number"] = str(row.get('Account Number', 'N/A'))
+        result["email"] = str(row.get('Email', ''))
+        result["phone"] = str(row.get('Phone', ''))
         
         analyzed_data.append(result)
 
-    results_df = pd.DataFrame(analyzed_data)
+    # 4. Save
+    if analyzed_data:
+        results_df = pd.DataFrame(analyzed_data)
+        db.save_results(results_df)
+        return {
+            "message": "Success",
+            "total_new_complaints": len(results_df),
+            "sample_output": results_df.head(3).to_dict(orient="records")
+        }
+    else:
+        return {"error": "No valid data found."}
 
-    # Save to Database (Persistence!)
-    db.save_results(results_df)
-
-    return {
-        "message": "Complaints analyzed and saved successfully",
-        "total_new_complaints": len(results_df),
-        "sample_output": results_df.head(3).to_dict(orient="records")
-    }
-
-# -------------------------
-# Chatbot Endpoint
-# -------------------------
 @app.post("/chat")
 def chat(query: str):
-    # Load latest data from DB every time we chat
+    """Smart Chatbot Endpoint"""
     current_data = db.load_data()
+    keywords = db.get_keywords() 
+    engine = ChatbotEngine(current_data, keywords)
     
-    if current_data.empty:
-        return {"error": "No data available. Please upload a file first."}
-
-    # Re-initialize chatbot with latest data
-    chatbot = ChatbotEngine(current_data)
-    response = chatbot.respond(query)
-
-    if isinstance(response, str):
-        return {"response": response}
-
-    if isinstance(response, pd.Series):
-        return {"response": response.to_dict()}
-        
-    return {
-        "response": response.to_dict(orient="records")
-    }
+    result = engine.respond(query)
+    
+    if isinstance(result, dict):
+        return result 
+    else:
+        return {"response": result}
 
 @app.get("/dashboard-stats")
 def get_stats():
-    """Returns metrics for the Dashboard"""
     return db.get_metrics()
 
-# -------------------------
-# Analytics Endpoint
-# -------------------------
 @app.get("/all-complaints")
-def get_all_complaints():
-    """Returns all records for the Analytics Dashboard"""
+def get_all():
     df = db.load_data()
-    if df.empty:
-        return []
-    return df.to_dict(orient="records")
-
-# -------------------------
-# Ticket Resolution Endpoint (UPDATED WITH EMAIL TRIGGER)
-# -------------------------
-class ComplaintUpdate(BaseModel):
-    id: int
-    status: str
-    action: str
+    return [] if df.empty else df.to_dict(orient="records")
 
 @app.post("/update-complaint")
 def update_complaint_status(update_data: ComplaintUpdate):
@@ -150,89 +138,55 @@ def update_complaint_status(update_data: ComplaintUpdate):
     )
     
     if success:
-        # 2. Check if we need to send email (Only if Resolved/Escalated)
-        if update_data.status in ["Resolved", "Escalated"]:
-            # Fetch customer details for this specific complaint ID
-            complaint_details = db.get_complaint(update_data.id)
+        # 2. Check if we need to send email
+        # We only email if status is Resolved/Escalated AND we have the mailer module
+        if update_data.status in ["Resolved", "Escalated"] and send_resolution_email:
+            # Get customer details
+            details = db.get_complaint(update_data.id)
             
-            # Send the email if the user has an email address
-            if complaint_details and complaint_details.get("email"):
-                print(f"Attempting to email {complaint_details['email']}...")
-                send_resolution_email(
-                    to_email=complaint_details["email"],
-                    customer_name=complaint_details["customer_name"],
-                    complaint_id=update_data.id,
-                    status=update_data.status,
-                    action_note=update_data.action
-                )
+            if details and details.get("email"):
+                print(f"📧 Sending email to {details['email']}...")
+                try:
+                    send_resolution_email(
+                        to_email=details["email"],
+                        customer_name=details["customer_name"],
+                        complaint_id=update_data.id,
+                        status=update_data.status,
+                        action_note=update_data.action
+                    )
+                except Exception as e:
+                    print(f"⚠️ Email failed: {e}")
         
         return {"message": "Update successful"}
     else:
         return {"error": "Failed to update database"}
 
-# -------------------------
-# Settings / Keywords Endpoints
-# -------------------------
-class KeywordAdd(BaseModel):
-    category: str
-    word: str
-
-@app.get("/keywords")
-def get_keywords():
-    """Fetch current keywords for the Settings page."""
-    return db.get_keywords()
-
-@app.post("/add-keyword")
-def add_new_keyword(data: KeywordAdd):
-    """Adds a new keyword to DB and updates the live AI model."""
-    success = db.add_keyword(data.category, data.word)
-    
-    if success:
-        # Crucial: Update the running AI instance immediately!
-        new_list = db.get_keywords()
-        analyzer.update_keywords(new_list)
-        return {"message": f"Added '{data.word}' to category '{data.category}'"}
-    else:
-        return {"error": "Keyword already exists or failed to add."}
-
-# NEW: PDF Report Endpoint
-# -------------------------
 @app.get("/generate-report")
 def get_pdf_report():
-    """Generates and returns a PDF file of all complaints."""
-    # 1. Get data from DB
+    if generate_pdf_report is None: return {"error": "Module missing."}
     data = db.load_data()
-    
-    if data.empty:
-        return {"error": "No data available to generate report"}
-    
-    # Convert DataFrame to list of dicts
-    records = data.to_dict(orient="records")
-    
-    # 2. Generate PDF using our helper
-    pdf_bytes = generate_pdf_report(records)
-    
-    # 3. Return as a File Response
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=complaint_report.pdf"}
-    )
+    if data.empty: return {"error": "No data"}
+    pdf_bytes = generate_pdf_report(data.to_dict(orient="records"))
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=complaint_report.pdf"})
 
-# AUTHENTICATION Endpoints
-# -------------------------
-@app.post("/register")
-def register_user(user: UserRegister):
-    success = db.create_user(user.email, user.password, user.full_name)
-    if success:
-        return {"message": "User registered successfully"}
-    else:
-        return {"error": "Email already exists"}
-
+# --- AUTH ---
 @app.post("/login")
-def login_user(user: UserLogin):
-    user_data = db.authenticate_user(user.email, user.password)
-    if user_data:
-        return {"message": "Login successful", "user": user_data}
-    else:
-        return {"error": "Invalid credentials"}
+def login(user: UserLogin):
+    u = db.authenticate_user(user.email, user.password)
+    return {"user": u} if u else Response(status_code=401)
+
+@app.post("/register")
+def register(user: UserRegister):
+    if db.create_user(user.email, user.password, user.full_name):
+        return {"message": "User created"}
+    return Response(status_code=400)
+
+# --- SETTINGS ---
+@app.get("/keywords")
+def get_kw(): return db.get_keywords()
+
+@app.post("/add-keyword")
+def add_kw(k: KeywordRequest):
+    if db.add_keyword(k.category, k.word): 
+        return {"message": "Added"}
+    return {"error": "Failed"}

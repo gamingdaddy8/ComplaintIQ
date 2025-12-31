@@ -1,0 +1,13 @@
+# Ignore Virtual Environment
+venv/
+env/
+
+# Ignore Database (Optional - keep this if you want to upload your sample data)
+# complaints.db 
+
+# Ignore Python Cache
+__pycache__/
+*.pyc
+
+# Ignore OS files
+.DS_Store
